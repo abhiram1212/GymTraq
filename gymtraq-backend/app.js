@@ -1,5 +1,8 @@
 require('dotenv').config();
 const express = require('express');
+const helmet = require('helmet');
+
+const { generalLimiter } = require('./middleware/rateLimit');
 
 const usersRouter = require('./routes/users');
 const exercisesRouter = require('./routes/exercises');
@@ -8,7 +11,12 @@ const entriesRouter = require('./routes/entries');
 const aiChatRouter = require('./routes/aiChat');
 
 const app = express();
-app.use(express.json());
+app.use(helmet());
+app.use(express.json({ limit: '1mb' }));
+app.use(generalLimiter);
+
+// Health check — open this in a browser to confirm the server is reachable
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.use('/users', usersRouter);
 app.use('/exercises', exercisesRouter);

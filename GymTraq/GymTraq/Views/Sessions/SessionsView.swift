@@ -2,7 +2,9 @@ import SwiftUI
 
 struct SessionsView: View {
     @Environment(AuthViewModel.self) private var authVM
-    @State private var vm = SessionsViewModel()
+    // Owned by HomeView and shared with the Progress tab
+    var vm: SessionsViewModel
+    @AppStorage("weeklyGoal") private var weeklyGoal = 3
     @State private var showAdd = false
     @State private var showProfile = false
     @State private var selectedSession: WorkoutSession?
@@ -15,13 +17,38 @@ struct SessionsView: View {
                 .padding(.top, 16)
                 .padding(.bottom, 16)
 
+            // Action failures (e.g. delete) when a list is showing — the full-screen
+            // error state below only covers load failures on an empty list
+            if let err = vm.errorMessage, !vm.sessions.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.circle")
+                    Text(err).font(.caption)
+                    Spacer()
+                }
+                .foregroundStyle(Color.appDanger)
+                .padding(10)
+                .background(Color.appDanger.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+                .task(id: err) {
+                    try? await Task.sleep(for: .seconds(4))
+                    vm.errorMessage = nil
+                }
+            }
+
             if vm.isLoading {
                 Spacer()
                 ProgressView().tint(.white)
                 Spacer()
+            } else if let err = vm.errorMessage, vm.sessions.isEmpty {
+                errorState(err)
             } else if vm.sessions.isEmpty {
                 emptyState
             } else {
+                weeklyGoalCard
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 10)
                 sessionList
             }
         }
@@ -32,7 +59,10 @@ struct SessionsView: View {
                 .padding(.bottom, 16)
         }
         .background { AnimatedBackground() }
-        .task { await vm.load() }
+        .task {
+            await vm.loadIfNeeded()
+            await UserStore.shared.loadIfNeeded() // header avatar
+        }
         .confirmationDialog(
             "Delete this session?",
             isPresented: Binding(
@@ -54,8 +84,15 @@ struct SessionsView: View {
         .sheet(isPresented: $showAdd) {
             AddSessionSheet(vm: vm)
         }
-        .sheet(item: $selectedSession) { session in
-            SessionDetailView(session: session) { updated in
+        .sheet(item: $selectedSession, onDismiss: {
+            // Sets added/removed in the detail view change the card summaries
+            Task { await vm.refreshEntries() }
+        }) { session in
+            SessionDetailView(
+                session: session,
+                historySessions: vm.sessions,
+                historyEntries: vm.allEntries
+            ) { updated in
                 vm.update(session: updated)
             }
         }
@@ -79,34 +116,150 @@ struct SessionsView: View {
             }
             Spacer()
             Button { showProfile = true } label: {
-                Image(systemName: "person.circle")
-                    .font(.system(size: 26, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.6))
+                // Live profile picture — updates the moment it's changed in Profile
+                AvatarView(user: UserStore.shared.user, size: 38)
             }
+            .buttonStyle(PressableCardStyle())
         }
     }
 
     // MARK: - Session list
 
+    // A plain, transparent List instead of ScrollView+LazyVStack — List is the
+    // only container where .swipeActions works, and swipe-to-delete is expected here
     private var sessionList: some View {
-        ScrollView {
-            LazyVStack(spacing: 12) {
-                ForEach(vm.sessions) { session in
+        List {
+            ForEach(vm.sessions) { session in
+                Button {
+                    selectedSession = session
+                } label: {
                     SessionCard(session: session, summary: vm.exerciseSummary(for: session.session_id))
-                        .onTapGesture { selectedSession = session }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button(role: .destructive) {
-                                sessionToDelete = session
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
+                }
+                .buttonStyle(PressableCardStyle()) // Apple-style press-down feedback
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button(role: .destructive) {
+                            sessionToDelete = session
+                        } label: {
+                            Label("Delete", systemImage: "trash")
                         }
+                    }
+                    // Swipe right to clone this workout into today
+                    .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                        Button {
+                            Task { await vm.repeatSession(session) }
+                        } label: {
+                            Label("Repeat", systemImage: "arrow.clockwise")
+                        }
+                        .tint(Color.appAccentDeep)
+                    }
+                    .contextMenu {
+                        Button {
+                            Task { await vm.repeatSession(session) }
+                        } label: {
+                            Label("Repeat Workout Today", systemImage: "arrow.clockwise")
+                        }
+                        Button(role: .destructive) {
+                            sessionToDelete = session
+                        } label: {
+                            Label("Delete Session", systemImage: "trash")
+                        }
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .scrollIndicators(.hidden)
+        .refreshable { await vm.load() }
+    }
+
+    // MARK: - Weekly goal & streak
+
+    private var weeklyGoalCard: some View {
+        GlassCard(padding: 14) {
+            HStack(spacing: 16) {
+                // Fitness-style progress ring
+                ZStack {
+                    Circle()
+                        .stroke(Color.appCardElevated, lineWidth: 6)
+                    Circle()
+                        .trim(from: 0, to: min(1, CGFloat(vm.thisWeekCount) / CGFloat(max(1, weeklyGoal))))
+                        .stroke(Color.appAccent, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .animation(.spring(duration: 0.6), value: vm.thisWeekCount)
+                    Text("\(vm.thisWeekCount)")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .contentTransition(.numericText())
+                }
+                .frame(width: 48, height: 48)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(vm.thisWeekCount) of \(weeklyGoal) workouts this week")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                    HStack(spacing: 4) {
+                        Image(systemName: "flame.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(vm.weekStreak > 0 ? .orange : .white.opacity(0.25))
+                        Text(vm.weekStreak > 0
+                             ? "\(vm.weekStreak)-week streak"
+                             : "Log a workout to start a streak")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                }
+
+                Spacer()
+
+                Menu {
+                    Picker("Weekly goal", selection: $weeklyGoal) {
+                        ForEach(1..<8) { n in
+                            Text("\(n) per week").tag(n)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.4))
+                        .padding(8)
+                        .background(Color.appCardElevated, in: Circle())
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 16)
         }
-        .scrollIndicators(.hidden)
+    }
+
+    // MARK: - Error state
+
+    private func errorState(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 50))
+                .foregroundStyle(.white.opacity(0.2))
+            Text("Couldn't load workouts")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.5))
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.3))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            Button {
+                Task { await vm.load() }
+            } label: {
+                Text("Retry")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 10)
+                    .background(.white.opacity(0.12), in: Capsule())
+            }
+            .padding(.top, 4)
+            Spacer()
+        }
     }
 
     // MARK: - Empty state
@@ -133,17 +286,17 @@ struct SessionsView: View {
         Button { showAdd = true } label: {
             Image(systemName: "plus")
                 .font(.system(size: 22, weight: .bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(.black)
                 .frame(width: 56, height: 56)
                 .background(
                     LinearGradient(
-                        colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                 Color(red: 0.45, green: 0.2, blue: 0.95)],
+                        colors: [Color.appAccent,
+                                 Color.appAccentDeep],
                         startPoint: .topLeading, endPoint: .bottomTrailing
                     )
                 )
                 .clipShape(Circle())
-                .shadow(color: Color(red: 0.3, green: 0.4, blue: 1.0).opacity(0.5),
+                .shadow(color: Color.appAccent.opacity(0.5),
                         radius: 16, y: 6)
         }
     }
@@ -208,6 +361,7 @@ struct AddSessionSheet: View {
     @State private var date = Date()
     @State private var notes = ""
     @State private var isLoading = false
+    @State private var errorMessage: String?
 
     var body: some View {
         VStack(spacing: 24) {
@@ -232,7 +386,7 @@ struct AddSessionSheet: View {
 
                     Divider().background(.white.opacity(0.1))
 
-                    DatePicker("Date", selection: $date, displayedComponents: .date)
+                    DatePicker("Date", selection: $date, in: ...Date(), displayedComponents: .date)
                         .foregroundStyle(.white)
                         .colorScheme(.dark)
 
@@ -245,23 +399,37 @@ struct AddSessionSheet: View {
             }
             .padding(.horizontal, 20)
 
-            GlassButton("Log Session", icon: "checkmark.circle.fill") {
+            if let err = errorMessage {
+                Text(err).font(.caption)
+                    .foregroundStyle(Color.appDanger)
+                    .padding(.horizontal, 20)
+            }
+
+            GlassButton(isLoading ? "Logging..." : "Log Session", icon: "checkmark.circle.fill") {
                 isLoading = true
+                errorMessage = nil
                 let formatter = DateFormatter()
                 formatter.dateFormat = "yyyy-MM-dd"
                 let trimmed = sessionName.trimmingCharacters(in: .whitespacesAndNewlines)
                 let finalName = trimmed.isEmpty ? timeOfDayName(for: date) : trimmed
                 Task {
-                    await vm.create(
+                    let ok = await vm.create(
                         date: formatter.string(from: date),
                         notes: notes.isEmpty ? nil : notes,
                         name: finalName
                     )
-                    dismiss()
+                    isLoading = false
+                    if ok {
+                        dismiss()
+                    } else {
+                        // Keep the sheet open so nothing is silently lost
+                        errorMessage = vm.errorMessage ?? "Couldn't save the session."
+                    }
                 }
             }
             .padding(.horizontal, 20)
             .disabled(isLoading)
+            .opacity(isLoading ? 0.6 : 1)
 
             Spacer()
         }

@@ -96,11 +96,14 @@ http://localhost:3000
 
 ---
 
-## UI Style
-- Dark mode first
-- Clean, minimal aesthetic
-- Accent color: electric blue (#007AFF)
-- Rounded cards for workout summaries
+## UI Style (Apple Fitness-inspired — see Views/Components/Theme.swift)
+- True black background with a faint static accent wash (no animated backdrops)
+- Accent: energetic lime `Color.appAccent` (Fitness Exercise-ring green); deep green companion for gradients
+- Destructive: `Color.appDanger` (Move-ring red); success: `Color.appSuccess`
+- Cards: flat `Color.appCard` (#1C1C1E), 20pt continuous corners, no strokes; fields on `Color.appCardElevated` (#2C2C2E)
+- CTAs: accent capsules with black semibold rounded labels; black glyphs on any accent surface
+- Type: SF Pro, SF Rounded for display/numbers; numeric stats use `.contentTransition(.numericText())`
+- Motion: press-scale on cards (`PressableCardStyle`), Liquid Glass floating tab bar with sliding selection pill
 - SF Symbols for icons
 
 ## Architecture Patterns
@@ -125,6 +128,8 @@ http://localhost:3000
 ### Users (public)
 - `POST /users` -- sign up (no auth)
 - `POST /users/login` -- login, returns JWT (no auth)
+- `POST /users/forgot-password` -- emails a 6-digit reset code via Gmail SMTP / nodemailer (generic response; no email enumeration)
+- `POST /users/reset-password` -- verifies code (15-min expiry, 5 attempts) + sets new password
 
 ### Users (protected)
 - `GET /users/:id` -- get own profile
@@ -132,8 +137,10 @@ http://localhost:3000
 - `DELETE /users/:id` -- delete account
 
 ### Exercises (protected)
-- `POST /exercises` -- create exercise
-- `GET /exercises` -- get all exercises
+- `POST /exercises` -- create exercise (409 on duplicate name)
+- `GET /exercises` -- own exercises + shared catalog (user_id IS NULL)
+- `PUT /exercises/:id` -- rename/re-categorize (own exercises only)
+- `DELETE /exercises/:id` -- delete (own only; 409 if referenced by entries)
 
 ### Sessions (protected)
 - `POST /sessions` -- create session
@@ -229,7 +236,7 @@ http://localhost:3000
 - Session detail: confirm notes save correctly after edit propagates back to SessionsView via `onUpdate` callback
 - Set renumbering after delete: verify DB updates fire correctly
 - Exercise picker in sessions: two-level (muscle group → exercise list → reps/weight form)
-- Forgot password: no email verification — resets by email match only (intentional for now, improve later with email OTP)
+- ~~Forgot password: no email verification~~ ✅ email OTP via Gmail SMTP / nodemailer (set GMAIL_USER + GMAIL_APP_PASSWORD in .env — App Password, not the account password; see .env.example)
 - Deploy backend (Railway / Render / Fly.io recommended)
 - TestFlight distribution
 
@@ -292,3 +299,19 @@ CREATE TABLE ai_chat_messages (
 - Has backend experience from a previous project (DocMind)
 - Familiar with SQL queries, REST endpoints, and system prompts
 - SwiftUI frontend will be handled entirely by Claude Code
+---
+
+# agent-device
+
+Use agent-device only for app/device automation tasks.
+Before planning device work, run `agent-device --version` and read `agent-device help workflow`.
+For exploratory QA, read `agent-device help dogfood`.
+For logs, network, audio, traces, or runtime failures, read `agent-device help debugging`.
+For React Native component trees, props/state/hooks, slow renders, or rerenders, read `agent-device help react-devtools`.
+For React Native JavaScript heap growth, heap snapshots, or retained-object leaks, read `agent-device help cdp`.
+For React Native apps, overlays, Metro/Fast Refresh blockers, and routing to React DevTools or debugging evidence, read `agent-device help react-native`.
+
+Use the CLI in the integrated terminal.
+If `agent-device` is not on PATH but the user installed it globally in another shell, resolve the absolute binary path instead of using `npx -y agent-device@latest`.
+Prefer `open -> snapshot -i -> act -> re-snapshot -> verify -> close`.
+Keep mutating commands against one session serial.

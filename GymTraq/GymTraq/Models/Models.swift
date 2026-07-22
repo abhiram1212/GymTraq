@@ -14,6 +14,8 @@ struct User: Codable {
     let height: Double?
     let age: Int?
     let sex: String?
+    let profile_pic: String? // base64 JPEG, downscaled client-side before upload
+    let created_at: String?  // ISO timestamp — "member since"
 }
 
 // MARK: - Exercise
@@ -21,7 +23,14 @@ struct Exercise: Codable, Identifiable, Hashable {
     let exercise_id: Int
     let exercise_name: String
     let muscle_group: String?
+    let user_id: Int? // nil = shared catalog; otherwise the owner
     var id: Int { exercise_id }
+
+    // Catalog rows (nil) are editable for now — they predate per-user ownership,
+    // so every pre-existing exercise would otherwise be permanently locked
+    var isEditable: Bool {
+        user_id == nil || user_id == APIService.shared.userId
+    }
 }
 
 // MARK: - Muscle Group
@@ -85,6 +94,20 @@ private func muscleGroupByKeyword(_ name: String) -> MuscleGroup {
 }
 
 // MARK: - Session
+
+// DateFormatter creation is expensive; these were being allocated twice per card,
+// per render. Shared instances are created once. (Only safe because all access
+// happens on the main actor via SwiftUI view bodies.)
+private let ymdParser: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f
+}()
+private let mediumDateFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateStyle = .medium; return f
+}()
+private let weekdayFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "EEEE"; return f
+}()
+
 struct WorkoutSession: Codable, Identifiable {
     let session_id: Int
     let date: String
@@ -94,20 +117,12 @@ struct WorkoutSession: Codable, Identifiable {
     var id: Int { session_id }
 
     var formattedDate: String {
-        let parser = DateFormatter()
-        parser.dateFormat = "yyyy-MM-dd"
-        let display = DateFormatter()
-        display.dateStyle = .medium
-        if let d = parser.date(from: date) { return display.string(from: d) }
+        if let d = ymdParser.date(from: date) { return mediumDateFormatter.string(from: d) }
         return date
     }
 
     var dayOfWeek: String {
-        let parser = DateFormatter()
-        parser.dateFormat = "yyyy-MM-dd"
-        let display = DateFormatter()
-        display.dateFormat = "EEEE"
-        if let d = parser.date(from: date) { return display.string(from: d) }
+        if let d = ymdParser.date(from: date) { return weekdayFormatter.string(from: d) }
         return ""
     }
 }
@@ -135,4 +150,11 @@ struct ChatMessage: Codable, Identifiable {
 // MARK: - API Error
 struct APIError: Codable {
     let error: String
+}
+
+// MARK: - Locale-tolerant number parsing
+// .decimalPad emits "," as the decimal separator in many locales; Double("80,5") is nil,
+// which silently dropped fields from PUT bodies and wiped stored values server-side.
+func parseDecimal(_ text: String) -> Double? {
+    Double(text.replacingOccurrences(of: ",", with: "."))
 }

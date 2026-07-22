@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/auth');
+const { aiLimiter } = require('../middleware/rateLimit');
 const controller = require('../controllers/aiChatController');
 
-router.post('/', auth, controller.sendMessage);
+router.post('/', auth, aiLimiter, controller.sendMessage);
 router.get('/', auth, controller.getChatHistory);
 router.delete('/:id', auth, controller.deleteMessage);
 

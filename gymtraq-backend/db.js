@@ -10,4 +10,9 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+// Without this, a dropped connection emits an 'error' with no listener and crashes the process
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle PG client', err);
+});
+
 module.exports = pool;

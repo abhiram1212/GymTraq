@@ -2,27 +2,55 @@ import Foundation
 
 @Observable
 class ExercisesViewModel {
-    var exercises: [Exercise] = []
-    var isLoading = false
+    private let store = ExerciseStore.shared
+
+    // Served from the shared cache — no per-screen copies, no duplicate fetches
+    var exercises: [Exercise] { store.exercises }
+    var isLoading: Bool { store.isLoading }
     var errorMessage: String?
 
-    func load() async {
-        isLoading = true
-        do {
-            exercises = try await APIService.shared.getExercises()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-        isLoading = false
+    /// Cache-first — free on tab switches after the first load.
+    func loadIfNeeded() async {
+        await store.loadIfNeeded()
+        errorMessage = store.errorMessage
     }
 
-    func create(name: String, muscleGroup: String?) async {
+    /// Explicit refresh (pull-to-refresh, retry button).
+    func load() async {
+        await store.refresh()
+        errorMessage = store.errorMessage
+    }
+
+    @discardableResult
+    func create(name: String, muscleGroup: String?) async -> Bool {
         do {
-            let ex = try await APIService.shared.createExercise(name: name, muscleGroup: muscleGroup)
-            exercises.append(ex)
-            exercises.sort { $0.exercise_name < $1.exercise_name }
+            _ = try await store.add(name: name, muscleGroup: muscleGroup)
+            return true
         } catch {
             errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func update(id: Int, name: String, muscleGroup: String?) async -> Bool {
+        do {
+            _ = try await store.update(id: id, name: name, muscleGroup: muscleGroup)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func delete(_ exercise: Exercise) async -> Bool {
+        do {
+            try await store.delete(id: exercise.exercise_id)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
         }
     }
 }

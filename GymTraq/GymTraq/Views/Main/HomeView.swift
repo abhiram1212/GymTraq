@@ -2,19 +2,28 @@ import SwiftUI
 
 struct HomeView: View {
     @State private var selectedTab = 0
+    @Namespace private var tabHighlight
+    // Shared between the Workouts and Progress tabs — one fetch feeds both
+    @State private var sessionsVM = SessionsViewModel()
 
     var body: some View {
         ZStack(alignment: .bottom) {
             TabView(selection: $selectedTab) {
-                SessionsView().tag(0)
-                ExercisesView().tag(1)
-                ChatView().tag(2)
-            }
-            // Hide native system tab bar — we use our own floating one
-            .toolbar(.hidden, for: .tabBar)
-            // Reserve space so scroll content never hides behind our tab bar
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                Color.clear.frame(height: 88)
+                // Both modifiers must be on each tab's CONTENT, not the TabView:
+                // .toolbar hides the system Liquid Glass bar, and .safeAreaInset
+                // reserves room for our floating bar (FABs, chat input included)
+                SessionsView(vm: sessionsVM).tag(0)
+                    .toolbar(.hidden, for: .tabBar)
+                    .safeAreaInset(edge: .bottom, spacing: 0) { Color.clear.frame(height: 88) }
+                ProgressTabView(vm: sessionsVM).tag(1)
+                    .toolbar(.hidden, for: .tabBar)
+                    .safeAreaInset(edge: .bottom, spacing: 0) { Color.clear.frame(height: 88) }
+                ExercisesView().tag(2)
+                    .toolbar(.hidden, for: .tabBar)
+                    .safeAreaInset(edge: .bottom, spacing: 0) { Color.clear.frame(height: 88) }
+                ChatView().tag(3)
+                    .toolbar(.hidden, for: .tabBar)
+                    .safeAreaInset(edge: .bottom, spacing: 0) { Color.clear.frame(height: 88) }
             }
 
             floatingTabBar
@@ -26,20 +35,24 @@ struct HomeView: View {
     }
 
     private var floatingTabBar: some View {
-        HStack(spacing: 0) {
-            tabItem(icon: "calendar.badge.plus",                   label: "Sessions",  tag: 0)
-            tabItem(icon: "figure.strengthtraining.traditional",   label: "Exercises", tag: 1)
-            tabItem(icon: "sparkles",                              label: "AI Coach",  tag: 2)
+        // GlassEffectContainer lets the bar's glass and the sliding
+        // selection glass blend instead of stacking as separate layers
+        GlassEffectContainer {
+            HStack(spacing: 4) {
+                tabItem(icon: "calendar.badge.plus",                 label: "Workouts",  tag: 0)
+                tabItem(icon: "chart.line.uptrend.xyaxis",           label: "Progress",  tag: 1)
+                tabItem(icon: "figure.strengthtraining.traditional", label: "Exercises", tag: 2)
+                tabItem(icon: "sparkles",                            label: "Coach",     tag: 3)
+            }
+            .padding(6)
+            .glassEffect(in: .capsule)
         }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 8)
-        .glassEffect(in: .capsule)
         .shadow(color: .black.opacity(0.2), radius: 12, y: 4)
     }
 
     private func tabItem(icon: String, label: String, tag: Int) -> some View {
         Button {
-            withAnimation(.spring(duration: 0.3)) { selectedTab = tag }
+            withAnimation(.spring(duration: 0.35)) { selectedTab = tag }
         } label: {
             VStack(spacing: 4) {
                 Image(systemName: icon)
@@ -49,14 +62,24 @@ struct HomeView: View {
                     .font(.system(size: 10, weight: .medium))
             }
             .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
             .foregroundStyle(
                 selectedTab == tag
                     ? AnyShapeStyle(LinearGradient(
-                        colors: [Color(red: 0.4, green: 0.7, blue: 1.0),
-                                 Color(red: 0.6, green: 0.3, blue: 1.0)],
+                        colors: [Color.appAccent,
+                                 Color.appAccentDeep],
                         startPoint: .topLeading, endPoint: .bottomTrailing))
                     : AnyShapeStyle(.white.opacity(0.35))
             )
+            .background {
+                // The selected button carries its own glass pill; matchedGeometryEffect
+                // slides it between tabs instead of leaving the glass static behind the bar
+                if selectedTab == tag {
+                    Color.clear
+                        .glassEffect(.regular.interactive(), in: .capsule)
+                        .matchedGeometryEffect(id: "selectedTab", in: tabHighlight)
+                }
+            }
         }
         .buttonStyle(.plain)
     }

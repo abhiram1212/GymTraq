@@ -1,22 +1,37 @@
 import SwiftUI
+import UIKit
 
 // MARK: - Session Detail
 
 struct SessionDetailView: View {
     @State private var session: WorkoutSession
     var onUpdate: ((WorkoutSession) -> Void)?
+    // Cross-session history from the sessions list — powers "last time" hints
+    // and personal-record detection without extra fetches
+    let historySessions: [WorkoutSession]
+    let historyEntries: [Entry]
     @State private var entries: [Entry] = []
     @State private var exercises: [Exercise] = []
     @State private var exerciseOrder: [Int] = []
     @State private var isLoading = false
+    @State private var loadError: String?
+    @State private var actionError: String?
+    @State private var prBanner: String?
+    @State private var restRemaining: Int?
+    @State private var restTask: Task<Void, Never>?
     @State private var showEditSession = false
     @State private var showAddExercise = false
     @State private var addSetTarget: Exercise?
     @State private var replaceTarget: ReplaceTarget?
     @Environment(\.dismiss) private var dismiss
 
-    init(session: WorkoutSession, onUpdate: ((WorkoutSession) -> Void)? = nil) {
+    init(session: WorkoutSession,
+         historySessions: [WorkoutSession] = [],
+         historyEntries: [Entry] = [],
+         onUpdate: ((WorkoutSession) -> Void)? = nil) {
         _session = State(initialValue: session)
+        self.historySessions = historySessions
+        self.historyEntries = historyEntries
         self.onUpdate = onUpdate
     }
 
@@ -40,10 +55,30 @@ struct SessionDetailView: View {
 
             if !entries.isEmpty { statsRow }
 
+            if let err = actionError {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.circle")
+                    Text(err).font(.caption)
+                    Spacer()
+                }
+                .foregroundStyle(Color.appDanger)
+                .padding(10)
+                .background(Color.appDanger.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+                .task(id: err) {
+                    try? await Task.sleep(for: .seconds(4))
+                    actionError = nil
+                }
+            }
+
             if isLoading {
                 Spacer()
                 ProgressView().tint(.white)
                 Spacer()
+            } else if let err = loadError {
+                errorState(err)
             } else if exerciseOrder.isEmpty {
                 emptyState
             } else {
@@ -52,9 +87,38 @@ struct SessionDetailView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .overlay(alignment: .bottomTrailing) {
-            addFAB
-                .padding(.trailing, 24)
-                .padding(.bottom, 16)
+            if loadError == nil {
+                addFAB
+                    .padding(.trailing, 24)
+                    .padding(.bottom, 16)
+            }
+        }
+        .overlay(alignment: .top) {
+            if let pr = prBanner {
+                HStack(spacing: 8) {
+                    Image(systemName: "trophy.fill").foregroundStyle(.black)
+                    Text(pr)
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .foregroundStyle(.black)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color.appAccent, in: Capsule())
+                .shadow(color: Color.appAccent.opacity(0.4), radius: 12, y: 4)
+                .padding(.top, 8)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .task(id: pr) {
+                    try? await Task.sleep(for: .seconds(3.5))
+                    withAnimation(.spring(duration: 0.4)) { prBanner = nil }
+                }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let remaining = restRemaining {
+                restBar(remaining)
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
         .background { AnimatedBackground() }
         .task { await loadData() }
@@ -65,8 +129,9 @@ struct SessionDetailView: View {
             }
         }
         .sheet(isPresented: $showAddExercise) {
-            AddEntrySheet(session: session, exercises: exercises, currentEntries: entries) { newEntry in
-                entries.append(newEntry)
+            AddEntrySheet(session: session, exercises: exercises, currentEntries: entries,
+                          lastPerformance: { lastPerformance(for: $0) }) { newEntry in
+                registerNewEntry(newEntry)
                 if !exerciseOrder.contains(newEntry.exercise_id) {
                     exerciseOrder.append(newEntry.exercise_id)
                 }
@@ -76,9 +141,10 @@ struct SessionDetailView: View {
             AddSetSheet(
                 session: session,
                 exercise: exercise,
-                setNumber: nextSetNumber(for: exercise.exercise_id)
+                setNumber: nextSetNumber(for: exercise.exercise_id),
+                lastPerformance: lastPerformance(for: exercise.exercise_id)
             ) { newEntry in
-                entries.append(newEntry)
+                registerNewEntry(newEntry)
             }
         }
         .sheet(item: $replaceTarget) { target in
@@ -86,17 +152,10 @@ struct SessionDetailView: View {
                 session: session,
                 exercises: exercises,
                 currentExerciseId: target.id
-            ) { newId in
-                entries = entries.map { e in
-                    e.exercise_id == target.id
-                        ? Entry(entry_id: e.entry_id, set_number: e.set_number,
-                                reps: e.reps, weight: e.weight,
-                                session_id: e.session_id, exercise_id: newId)
-                        : e
-                }
-                if let idx = exerciseOrder.firstIndex(of: target.id) {
-                    exerciseOrder[idx] = newId
-                }
+            ) { _ in
+                // The server may merge the sets into an existing group and renumber
+                // them — reload rather than guessing the result locally
+                Task { await loadData() }
             }
         }
         .colorScheme(.dark)
@@ -126,12 +185,12 @@ struct SessionDetailView: View {
             Button { showEditSession = true } label: {
                 Image(systemName: "pencil")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(.black)
                     .padding(10)
                     .background(
                         LinearGradient(
-                            colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                     Color(red: 0.45, green: 0.2, blue: 0.95)],
+                            colors: [Color.appAccent,
+                                     Color.appAccentDeep],
                             startPoint: .topLeading, endPoint: .bottomTrailing
                         ),
                         in: Circle()
@@ -152,6 +211,35 @@ struct SessionDetailView: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 10)
+    }
+
+    // MARK: - Error state
+
+    private func errorState(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 44))
+                .foregroundStyle(.white.opacity(0.2))
+            Text("Couldn't load this session")
+                .foregroundStyle(.white.opacity(0.5))
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.3))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            Button {
+                Task { await loadData() }
+            } label: {
+                Text("Retry")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 10)
+                    .background(.white.opacity(0.12), in: Capsule())
+            }
+            Spacer()
+        }
     }
 
     // MARK: - Empty state
@@ -192,17 +280,17 @@ struct SessionDetailView: View {
         Button { showAddExercise = true } label: {
             Image(systemName: "plus")
                 .font(.system(size: 22, weight: .bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(.black)
                 .frame(width: 56, height: 56)
                 .background(
                     LinearGradient(
-                        colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                 Color(red: 0.45, green: 0.2, blue: 0.95)],
+                        colors: [Color.appAccent,
+                                 Color.appAccentDeep],
                         startPoint: .topLeading, endPoint: .bottomTrailing
                     )
                 )
                 .clipShape(Circle())
-                .shadow(color: Color(red: 0.3, green: 0.4, blue: 1.0).opacity(0.5), radius: 16, y: 6)
+                .shadow(color: Color.appAccent.opacity(0.5), radius: 16, y: 6)
         }
     }
 
@@ -277,7 +365,7 @@ struct SessionDetailView: View {
                     HStack {
                         Text("\(entry.set_number)")
                             .frame(width: 36, alignment: .leading)
-                            .foregroundStyle(Color(red: 0.4, green: 0.7, blue: 1.0))
+                            .foregroundStyle(Color.appAccent)
                             .fontWeight(.bold)
                         Text("\(entry.reps) reps")
                             .frame(maxWidth: .infinity, alignment: .center)
@@ -288,7 +376,7 @@ struct SessionDetailView: View {
                         } label: {
                             Image(systemName: "trash")
                                 .font(.system(size: 12))
-                                .foregroundStyle(Color(red: 1, green: 0.35, blue: 0.35).opacity(0.7))
+                                .foregroundStyle(Color.appDanger.opacity(0.7))
                                 .frame(width: 32, height: 32)
                         }
                     }
@@ -304,11 +392,11 @@ struct SessionDetailView: View {
                         Image(systemName: "plus.circle.fill").font(.system(size: 13))
                         Text("Add Set").font(.system(size: 13, weight: .semibold))
                     }
-                    .foregroundStyle(Color(red: 0.4, green: 0.7, blue: 1.0))
+                    .foregroundStyle(Color.appAccent)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
                     .background(
-                        Color(red: 0.4, green: 0.7, blue: 1.0).opacity(0.1),
+                        Color.appAccent.opacity(0.1),
                         in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                     )
                 }
@@ -316,43 +404,145 @@ struct SessionDetailView: View {
         }
     }
 
-    // MARK: - Delete set with renumbering
+    // MARK: - New entry: PR detection + rest timer
 
+    private func registerNewEntry(_ newEntry: Entry) {
+        // PR = beats every previous set for this exercise. Requires prior data,
+        // so a brand-new exercise's first set isn't a hollow "PR".
+        let priorMax = (historyEntries.filter { $0.exercise_id == newEntry.exercise_id && $0.session_id != session.session_id }
+                        + entries.filter { $0.exercise_id == newEntry.exercise_id })
+            .map(\.weight).max()
+        entries.append(newEntry)
+
+        if let priorMax, newEntry.weight > priorMax {
+            let name = exercises.first { $0.exercise_id == newEntry.exercise_id }?.exercise_name ?? "Exercise"
+            withAnimation(.spring(duration: 0.4)) {
+                prBanner = "New PR — \(name) \(formatWeight(newEntry.weight)) kg!"
+            }
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        }
+
+        startRest()
+    }
+
+    // MARK: - "Last time" hint
+
+    /// Summary of the most recent earlier session containing this exercise,
+    /// e.g. "3 sets · top 60 kg × 8 · Jul 15".
+    private func lastPerformance(for exerciseId: Int) -> String? {
+        let grouped = Dictionary(
+            grouping: historyEntries.filter { $0.exercise_id == exerciseId && $0.session_id != session.session_id },
+            by: \.session_id
+        )
+        let dated: [(date: String, sets: [Entry])] = grouped.compactMap { sid, sets in
+            guard let s = historySessions.first(where: { $0.session_id == sid }),
+                  s.date <= session.date else { return nil }
+            return (s.date, sets)
+        }.sorted { $0.date > $1.date }
+
+        guard let last = dated.first,
+              let top = last.sets.max(by: { $0.weight < $1.weight }) else { return nil }
+        let when = historySessions.first { $0.date == last.date }?.formattedDate ?? last.date
+        return "\(last.sets.count) set\(last.sets.count == 1 ? "" : "s") · top \(formatWeight(top.weight)) kg × \(top.reps) · \(when)"
+    }
+
+    private func formatWeight(_ w: Double) -> String {
+        w.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%.0f", w) : String(format: "%.1f", w)
+    }
+
+    // MARK: - Rest timer
+
+    private func startRest(_ seconds: Int = 90) {
+        restTask?.cancel()
+        withAnimation(.spring(duration: 0.35)) { restRemaining = seconds }
+        restTask = Task {
+            while let r = restRemaining, r > 0 {
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { return }
+                restRemaining = r - 1
+            }
+            guard !Task.isCancelled else { return }
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            try? await Task.sleep(for: .seconds(2))
+            if !Task.isCancelled {
+                withAnimation(.spring(duration: 0.35)) { restRemaining = nil }
+            }
+        }
+    }
+
+    private func restBar(_ remaining: Int) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "timer")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(remaining == 0 ? Color.appAccent : .white.opacity(0.7))
+            Text(remaining == 0 ? "Rest done — go!" : String(format: "Rest %d:%02d", remaining / 60, remaining % 60))
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .contentTransition(.numericText(countsDown: true))
+                .animation(.snappy, value: remaining)
+
+            if remaining > 0 {
+                Button {
+                    restRemaining = remaining + 30
+                } label: {
+                    Text("+30s")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.appAccent)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.appAccent.opacity(0.15), in: Capsule())
+                }
+            }
+
+            Button {
+                restTask?.cancel()
+                withAnimation(.spring(duration: 0.35)) { restRemaining = nil }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .padding(6)
+                    .background(.white.opacity(0.1), in: Circle())
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.appCardElevated, in: Capsule())
+        .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+    }
+
+    // MARK: - Delete set
+
+    // The server deletes and renumbers the exercise's sets in one transaction;
+    // here we just mirror that result locally — and only after the call succeeds.
     private func deleteSet(entry: Entry) {
         let exerciseId = entry.exercise_id
-        let deletedSetNum = entry.set_number
-
         Task {
-            try? await APIService.shared.deleteEntry(id: entry.entry_id)
+            do {
+                try await APIService.shared.deleteEntry(id: entry.entry_id)
+            } catch {
+                actionError = error.localizedDescription
+                return
+            }
 
-            // Remove from local state
             entries.removeAll { $0.entry_id == entry.entry_id }
             if !entries.contains(where: { $0.exercise_id == exerciseId }) {
                 exerciseOrder.removeAll { $0 == exerciseId }
                 return
             }
 
-            // Renumber remaining sets for this exercise
+            // Mirror the server's 1..n renumbering
             let remaining = entries
                 .filter { $0.exercise_id == exerciseId }
                 .sorted { $0.set_number < $1.set_number }
-
-            for (i, e) in remaining.enumerated() {
-                let newNum = i + 1
-                guard e.set_number != newNum else { continue }
-                // Only renumber entries that were after the deleted set
-                guard e.set_number > deletedSetNum else { continue }
-
-                // Update local state
+            for (i, e) in remaining.enumerated() where e.set_number != i + 1 {
                 if let idx = entries.firstIndex(where: { $0.entry_id == e.entry_id }) {
                     entries[idx] = Entry(
-                        entry_id: e.entry_id, set_number: newNum,
+                        entry_id: e.entry_id, set_number: i + 1,
                         reps: e.reps, weight: e.weight,
                         session_id: e.session_id, exercise_id: e.exercise_id
                     )
                 }
-                // Persist to DB
-                Task { try? await APIService.shared.updateEntrySetNumber(id: e.entry_id, setNumber: newNum) }
             }
         }
     }
@@ -374,16 +564,24 @@ struct SessionDetailView: View {
 
     private func loadData() async {
         isLoading = true
-        async let e  = APIService.shared.getEntries(sessionId: session.session_id)
-        async let ex = APIService.shared.getExercises()
-        let loaded = (try? await e) ?? []
-        exercises  = (try? await ex) ?? []
-        entries    = loaded
-        var seen = Set<Int>(); var order: [Int] = []
-        for entry in loaded where !seen.contains(entry.exercise_id) {
-            seen.insert(entry.exercise_id); order.append(entry.exercise_id)
+        loadError = nil
+        do {
+            // Entries are per-session and fetched fresh; the exercise catalog
+            // comes from the shared cache (usually already in memory)
+            async let e = APIService.shared.getEntries(sessionId: session.session_id)
+            await ExerciseStore.shared.loadIfNeeded()
+            exercises  = ExerciseStore.shared.exercises
+            let loaded = try await e
+            entries    = loaded
+            var seen = Set<Int>(); var order: [Int] = []
+            for entry in loaded where !seen.contains(entry.exercise_id) {
+                seen.insert(entry.exercise_id); order.append(entry.exercise_id)
+            }
+            exerciseOrder = order
+        } catch {
+            // Don't render a fake "No exercises yet" over a network failure
+            loadError = error.localizedDescription
         }
-        exerciseOrder = order
         isLoading = false
     }
 
@@ -392,9 +590,12 @@ struct SessionDetailView: View {
     private func statBadge(_ value: String, _ label: String) -> some View {
         GlassCard(padding: 10) {
             VStack(spacing: 2) {
+                // Numbers roll like Apple's activity counters when sets change
                 Text(value)
                     .font(.system(size: 18, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
+                    .contentTransition(.numericText())
+                    .animation(.snappy, value: value)
                 Text(label)
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.white.opacity(0.4))
@@ -462,7 +663,7 @@ struct EditSessionSheet: View {
                             .foregroundStyle(.white.opacity(0.45)).frame(width: 20)
                         Text("Date").font(.subheadline).foregroundStyle(.white.opacity(0.6))
                         Spacer()
-                        DatePicker("", selection: $selectedDate, displayedComponents: .date)
+                        DatePicker("", selection: $selectedDate, in: ...Date(), displayedComponents: .date)
                             .datePickerStyle(.compact).labelsHidden().colorScheme(.dark)
                     }
                     Divider().background(.white.opacity(0.08))
@@ -478,7 +679,7 @@ struct EditSessionSheet: View {
 
             if let err = errorMessage {
                 Text(err).font(.caption)
-                    .foregroundStyle(Color(red: 1, green: 0.4, blue: 0.4))
+                    .foregroundStyle(Color.appDanger)
             }
 
             GlassButton(isLoading ? "Saving..." : "Save Changes", icon: "checkmark.circle.fill") {
@@ -514,11 +715,13 @@ struct AddEntrySheet: View {
     let session: WorkoutSession
     let exercises: [Exercise]
     let currentEntries: [Entry]
+    var lastPerformance: (Int) -> String? = { _ in nil }
     let onAdd: (Entry) -> Void
     @Environment(\.dismiss) private var dismiss
 
     @State private var selectedGroup: MuscleGroup? = nil
     @State private var selectedExercise: Exercise? = nil
+    @State private var searchText = ""
     @State private var reps = ""
     @State private var weight = ""
     @State private var isLoading = false
@@ -551,13 +754,16 @@ struct AddEntrySheet: View {
                             Text("Groups")
                                 .font(.subheadline.weight(.medium))
                         }
-                        .foregroundStyle(Color(red: 0.4, green: 0.7, blue: 1.0))
+                        .foregroundStyle(Color.appAccent)
                     }
                 } else {
                     Color.clear.frame(width: 70)
                 }
                 Spacer()
-                Text(selectedGroup == nil ? "Add Exercise" : selectedGroup!.rawValue)
+                // Search results span all groups — don't title them with one group's name
+                Text(!searchText.isEmpty && selectedExercise == nil
+                     ? "Add Exercise"
+                     : (selectedGroup == nil ? "Add Exercise" : selectedGroup!.rawValue))
                     .font(.title2.bold()).foregroundStyle(.white)
                 Spacer()
                 Color.clear.frame(width: 70)
@@ -568,26 +774,112 @@ struct AddEntrySheet: View {
             if let exercise = selectedExercise {
                 // Phase 3: reps/weight form
                 exerciseForm(exercise: exercise)
-            } else if let group = selectedGroup {
-                // Phase 2: exercises in group
-                exerciseList(for: group)
+            } else if exercises.isEmpty {
+                // Nothing in the catalog — say so instead of showing a blank screen
+                VStack(spacing: 12) {
+                    Spacer()
+                    Image(systemName: "dumbbell")
+                        .font(.system(size: 44))
+                        .foregroundStyle(.white.opacity(0.15))
+                    Text("No exercises in your library")
+                        .foregroundStyle(.white.opacity(0.4))
+                    Text("Add exercises from the Exercises tab first")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.25))
+                    Spacer()
+                }
             } else {
-                // Phase 1: muscle group list
-                muscleGroupList
+                searchBar
+
+                if !searchText.isEmpty {
+                    // Search cuts across all groups
+                    searchResults
+                } else if let group = selectedGroup {
+                    // Phase 2: exercises in group
+                    exerciseList(for: group)
+                } else {
+                    // Phase 1: muscle group list
+                    muscleGroupList
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background { AnimatedBackground() }
+        .keyboardDoneButton()
         .colorScheme(.dark)
+    }
+
+    // MARK: - Search
+
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.4))
+            TextField("Search exercises", text: $searchText).foregroundStyle(.white)
+            if !searchText.isEmpty {
+                Button { searchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.4))
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.appCard, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.1), lineWidth: 1))
+        .padding(.horizontal, 20)
+        .padding(.bottom, 12)
+    }
+
+    private var searchResults: some View {
+        let matches = exercises.filter {
+            $0.exercise_name.localizedCaseInsensitiveContains(searchText)
+        }
+        return ScrollView {
+            LazyVStack(spacing: 8) {
+                if matches.isEmpty {
+                    Text("No matches")
+                        .foregroundStyle(.white.opacity(0.35))
+                        .padding(.top, 24)
+                }
+                ForEach(matches) { ex in
+                    Button { selectedExercise = ex } label: {
+                        GlassCard(padding: 14) {
+                            HStack(spacing: 12) {
+                                let group = muscleGroup(for: ex)
+                                Circle()
+                                    .fill(group.color.opacity(0.15))
+                                    .frame(width: 30, height: 30)
+                                    .overlay(
+                                        Image(systemName: "dumbbell")
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .foregroundStyle(group.color)
+                                    )
+                                Text(ex.exercise_name)
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(.white)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.25))
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 32)
+        }
+        .scrollIndicators(.hidden)
     }
 
     // MARK: - Phase 1: Muscle group list
 
     private var muscleGroupList: some View {
-        ScrollView {
+        // One classification pass for the whole catalog, not one per group
+        let grouped = Dictionary(grouping: exercises) { muscleGroup(for: $0) }
+        return ScrollView {
             LazyVStack(spacing: 8) {
                 ForEach(MuscleGroup.allCases, id: \.self) { group in
-                    let groupExs = exercisesIn(group)
+                    let groupExs = grouped[group] ?? []
                     if !groupExs.isEmpty {
                         Button { selectedGroup = group } label: {
                             GlassCard(padding: 14) {
@@ -682,6 +974,23 @@ struct AddEntrySheet: View {
             }
             .padding(.horizontal, 20)
 
+            // What you did last time — the number you actually came here for
+            if let hint = lastPerformance(exercise.exercise_id) {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Color.appAccent)
+                    Text("Last time: \(hint)")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.7))
+                    Spacer()
+                }
+                .padding(12)
+                .background(Color.appAccent.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 20)
+            }
+
             GlassCard {
                 HStack(spacing: 10) {
                     numField("Reps", text: $reps)
@@ -692,11 +1001,11 @@ struct AddEntrySheet: View {
 
             if let err = errorMessage {
                 Text(err).font(.caption)
-                    .foregroundStyle(Color(red: 1, green: 0.4, blue: 0.4))
+                    .foregroundStyle(Color.appDanger)
             }
 
-            GlassButton("Add Set", icon: "plus.circle.fill") {
-                guard let repsN = Int(reps), let weightD = Double(weight) else {
+            GlassButton(isLoading ? "Adding..." : "Add Set", icon: "plus.circle.fill") {
+                guard let repsN = Int(reps), let weightD = parseDecimal(weight) else {
                     errorMessage = "Fill in all fields correctly."; return
                 }
                 let setN = nextSetNumber(for: exercise.exercise_id)
@@ -734,6 +1043,7 @@ struct AddSetSheet: View {
     let session: WorkoutSession
     let exercise: Exercise
     let setNumber: Int
+    var lastPerformance: String? = nil
     let onAdd: (Entry) -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -752,6 +1062,22 @@ struct AddSetSheet: View {
                 Text(exercise.exercise_name).font(.subheadline).foregroundStyle(.white.opacity(0.5))
             }
 
+            if let hint = lastPerformance {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Color.appAccent)
+                    Text("Last time: \(hint)")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.7))
+                    Spacer()
+                }
+                .padding(12)
+                .background(Color.appAccent.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 20)
+            }
+
             GlassCard {
                 HStack(spacing: 10) {
                     numField("Reps", text: $reps)
@@ -762,11 +1088,11 @@ struct AddSetSheet: View {
 
             if let err = errorMessage {
                 Text(err).font(.caption)
-                    .foregroundStyle(Color(red: 1, green: 0.4, blue: 0.4))
+                    .foregroundStyle(Color.appDanger)
             }
 
-            GlassButton("Add Set \(setNumber)", icon: "plus.circle.fill") {
-                guard let repsN = Int(reps), let weightD = Double(weight) else {
+            GlassButton(isLoading ? "Adding..." : "Add Set \(setNumber)", icon: "plus.circle.fill") {
+                guard let repsN = Int(reps), let weightD = parseDecimal(weight) else {
                     errorMessage = "Fill in all fields correctly."; return
                 }
                 isLoading = true
@@ -788,6 +1114,7 @@ struct AddSetSheet: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background { AnimatedBackground() }
+        .keyboardDoneButton()
         .colorScheme(.dark)
     }
 
@@ -836,13 +1163,13 @@ struct ReplaceExerciseSheet: View {
                 }
             }
             .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(Color.appCard, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.1), lineWidth: 1))
             .padding(.horizontal, 20).padding(.bottom, 12)
 
             if let err = errorMessage {
                 Text(err).font(.caption)
-                    .foregroundStyle(Color(red: 1, green: 0.4, blue: 0.4))
+                    .foregroundStyle(Color.appDanger)
                     .padding(.horizontal, 20).padding(.bottom, 8)
             }
 
@@ -870,7 +1197,7 @@ struct ReplaceExerciseSheet: View {
                                 HStack(spacing: 14) {
                                     Image(systemName: "figure.strengthtraining.traditional")
                                         .font(.system(size: 14))
-                                        .foregroundStyle(Color(red: 0.4, green: 0.7, blue: 1.0))
+                                        .foregroundStyle(Color.appAccent)
                                         .frame(width: 32, height: 32)
                                         .background(.white.opacity(0.08), in: Circle())
                                     Text(ex.exercise_name)

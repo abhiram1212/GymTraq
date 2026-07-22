@@ -15,27 +15,45 @@ enum APIServiceError: LocalizedError {
 @Observable
 class APIService {
     static let shared = APIService()
-    private let baseURL = "http://localhost:3000"
+    private let baseURL = "http://192.168.0.206:3000"
 
-    // Stored property so @Observable tracks changes and triggers SwiftUI re-renders
+    // URLSession.shared waits 60s per request — far too long for a snappy UI.
+    // Fail fast so error states show within seconds when the server is unreachable.
+    private let urlSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 30
+        return URLSession(configuration: config)
+    }()
+
+    private static let tokenKey = "gymtraq_token"
+
+    // Stored property so @Observable tracks changes and triggers SwiftUI re-renders.
+    // Persisted in the Keychain (not UserDefaults) so the JWT isn't stored in plaintext.
     var token: String? {
         didSet {
             if let token {
-                UserDefaults.standard.set(token, forKey: "gymtraq_token")
+                KeychainHelper.save(token, for: Self.tokenKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: "gymtraq_token")
+                KeychainHelper.delete(Self.tokenKey)
             }
         }
     }
 
     private init() {
-        // Rehydrate token from disk on launch
-        self.token = UserDefaults.standard.string(forKey: "gymtraq_token")
+        // Rehydrate from the Keychain, but reject an already-expired token —
+        // otherwise the app flashes Home and immediately 401s back to login
+        if let stored = KeychainHelper.read(Self.tokenKey), !Self.isExpired(stored) {
+            self.token = stored
+        } else {
+            self.token = nil
+            KeychainHelper.delete(Self.tokenKey) // didSet doesn't fire in init
+        }
     }
 
     var userId: Int? {
         guard let token else { return nil }
-        return decodeJWT(token)
+        return Self.decodePayload(token)?["user_id"] as? Int
     }
 
     var isAuthenticated: Bool { token != nil }
@@ -43,7 +61,7 @@ class APIService {
     func logout() { token = nil }
 
     // MARK: - JWT decode (client-side, verification done by server)
-    private func decodeJWT(_ token: String) -> Int? {
+    private static func decodePayload(_ token: String) -> [String: Any]? {
         let parts = token.components(separatedBy: ".")
         guard parts.count == 3 else { return nil }
         var b64 = parts[1]
@@ -52,9 +70,13 @@ class APIService {
         let rem = b64.count % 4
         if rem > 0 { b64 += String(repeating: "=", count: 4 - rem) }
         guard let data = Data(base64Encoded: b64),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let uid = json["user_id"] as? Int else { return nil }
-        return uid
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return json
+    }
+
+    private static func isExpired(_ token: String) -> Bool {
+        guard let exp = decodePayload(token)?["exp"] as? Double else { return false }
+        return Date(timeIntervalSince1970: exp) <= Date()
     }
 
     // MARK: - Core request
@@ -74,9 +96,15 @@ class APIService {
         if let body {
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
-        let (data, response) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await urlSession.data(for: req)
         guard let http = response as? HTTPURLResponse else { throw APIServiceError.badResponse }
         guard (200...299).contains(http.statusCode) else {
+            // Token rejected (expired or invalid) — clear it so the app routes back to login
+            // instead of leaving the user stuck on screens where every request 401s.
+            if http.statusCode == 401, requiresAuth, token != nil {
+                await MainActor.run { logout() }
+                throw APIServiceError.serverError("Session expired. Please sign in again.")
+            }
             if let apiErr = try? JSONDecoder().decode(APIError.self, from: data) {
                 throw APIServiceError.serverError(apiErr.error)
             }
@@ -110,12 +138,21 @@ class APIService {
     }
 
     func updateUser(id: Int, weight: Double?, height: Double?, age: Int?, sex: String?) async throws -> User {
-        var body: [String: Any] = [:]
-        if let weight { body["weight"] = weight }
-        if let height { body["height"] = height }
-        if let age    { body["age"]    = age    }
-        if let sex    { body["sex"]    = sex    }
+        // Send every field explicitly — NSNull means "clear this value".
+        // The backend patches only the keys present, so nothing is wiped by accident.
+        let body: [String: Any] = [
+            "weight": weight ?? NSNull(),
+            "height": height ?? NSNull(),
+            "age":    age    ?? NSNull(),
+            "sex":    sex    ?? NSNull(),
+        ]
         let data = try await request("/users/\(id)", method: "PUT", body: body)
+        return try JSONDecoder().decode(User.self, from: data)
+    }
+
+    func updateProfilePic(id: Int, base64: String) async throws -> User {
+        // Patch semantics server-side: only profile_pic changes
+        let data = try await request("/users/\(id)", method: "PUT", body: ["profile_pic": base64])
         return try JSONDecoder().decode(User.self, from: data)
     }
 
@@ -157,9 +194,30 @@ class APIService {
         return try JSONDecoder().decode(Exercise.self, from: data)
     }
 
-    func forgotPassword(email: String, newPassword: String) async throws {
+    func updateExercise(id: Int, name: String, muscleGroup: String?) async throws -> Exercise {
+        let body: [String: Any] = [
+            "exercise_name": name,
+            "muscle_group": muscleGroup ?? NSNull(),
+        ]
+        let data = try await request("/exercises/\(id)", method: "PUT", body: body)
+        return try JSONDecoder().decode(Exercise.self, from: data)
+    }
+
+    func deleteExercise(id: Int) async throws {
+        _ = try await request("/exercises/\(id)", method: "DELETE")
+    }
+
+    // Step 1: server emails a 6-digit code (via Resend)
+    func requestPasswordReset(email: String) async throws {
         _ = try await request("/users/forgot-password", method: "POST",
-                              body: ["email": email, "newPassword": newPassword],
+                              body: ["email": email],
+                              requiresAuth: false)
+    }
+
+    // Step 2: verify code + set new password
+    func resetPassword(email: String, code: String, newPassword: String) async throws {
+        _ = try await request("/users/reset-password", method: "POST",
+                              body: ["email": email, "code": code, "newPassword": newPassword],
                               requiresAuth: false)
     }
 
@@ -181,7 +239,8 @@ class APIService {
     func updateSession(id: Int, date: String, notes: String?, name: String?) async throws -> WorkoutSession {
         var body: [String: Any] = ["date": date]
         body["notes"] = notes ?? NSNull()
-        if let name { body["name"] = name }
+        // Always send name (NSNull clears it) — matches notes semantics so users can clear a session name
+        body["name"] = name ?? NSNull()
         let data = try await request("/sessions/\(id)", method: "PUT", body: body)
         return try JSONDecoder().decode(WorkoutSession.self, from: data)
     }
@@ -189,10 +248,6 @@ class APIService {
     func getAllEntries() async throws -> [Entry] {
         let data = try await request("/entries")
         return try JSONDecoder().decode([Entry].self, from: data)
-    }
-
-    func updateEntrySetNumber(id: Int, setNumber: Int) async throws {
-        _ = try await request("/entries/\(id)", method: "PUT", body: ["set_number": setNumber])
     }
 
     func deleteEntry(id: Int) async throws {

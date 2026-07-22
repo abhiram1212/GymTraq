@@ -6,6 +6,8 @@ struct ExercisesView: View {
     @State private var vm = ExercisesViewModel()
     @State private var showAdd = false
     @State private var searchText = ""
+    @State private var editTarget: Exercise?
+    @State private var deleteTarget: Exercise?
 
     private var filtered: [Exercise] {
         searchText.isEmpty ? vm.exercises
@@ -28,6 +30,25 @@ struct ExercisesView: View {
             .padding(.top, 16)
             .padding(.bottom, 14)
 
+            // Action failures (delete blocked, rename conflict) while a list is showing
+            if let err = vm.errorMessage, !vm.exercises.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.circle")
+                    Text(err).font(.caption)
+                    Spacer()
+                }
+                .foregroundStyle(Color.appDanger)
+                .padding(10)
+                .background(Color.appDanger.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+                .task(id: err) {
+                    try? await Task.sleep(for: .seconds(5))
+                    vm.errorMessage = nil
+                }
+            }
+
             // Search bar
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.4))
@@ -39,7 +60,7 @@ struct ExercisesView: View {
                 }
             }
             .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(Color.appCard, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.1), lineWidth: 1))
             .padding(.horizontal, 20)
             .padding(.bottom, 12)
@@ -48,6 +69,32 @@ struct ExercisesView: View {
                 Spacer()
                 ProgressView().tint(.white)
                 Spacer()
+            } else if let err = vm.errorMessage, vm.exercises.isEmpty {
+                // Network failure — don't disguise it as an empty library
+                VStack(spacing: 12) {
+                    Spacer()
+                    Image(systemName: "wifi.exclamationmark")
+                        .font(.system(size: 50))
+                        .foregroundStyle(.white.opacity(0.2))
+                    Text("Couldn't load exercises")
+                        .foregroundStyle(.white.opacity(0.5))
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.3))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
+                    Button {
+                        Task { await vm.load() }
+                    } label: {
+                        Text("Retry")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 10)
+                            .background(.white.opacity(0.12), in: Capsule())
+                    }
+                    Spacer()
+                }
             } else if filtered.isEmpty {
                 VStack(spacing: 12) {
                     Spacer()
@@ -70,12 +117,15 @@ struct ExercisesView: View {
                     .padding(.bottom, 100)
                 }
                 .scrollIndicators(.hidden)
+                .refreshable { await vm.load() }
             } else {
-                // Sectioned list by muscle group
+                // Sectioned list by muscle group — grouped in ONE pass instead of
+                // re-running the keyword classifier per group per render
+                let grouped = Dictionary(grouping: vm.exercises) { muscleGroup(for: $0) }
                 ScrollView {
                     LazyVStack(spacing: 0, pinnedViews: .sectionHeaders) {
                         ForEach(MuscleGroup.allCases, id: \.self) { group in
-                            let groupExercises = vm.exercises.filter { muscleGroup(for: $0) == group }
+                            let groupExercises = grouped[group] ?? []
                             if !groupExercises.isEmpty {
                                 Section {
                                     LazyVStack(spacing: 8) {
@@ -95,6 +145,7 @@ struct ExercisesView: View {
                     .padding(.bottom, 100)
                 }
                 .scrollIndicators(.hidden)
+                .refreshable { await vm.load() }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -104,17 +155,39 @@ struct ExercisesView: View {
                 .padding(.bottom, 16)
         }
         .background { AnimatedBackground() }
-        .task { await vm.load() }
+        .task { await vm.loadIfNeeded() }
         .sheet(isPresented: $showAdd) {
             AddExerciseSheet(vm: vm)
+        }
+        .sheet(item: $editTarget) { exercise in
+            EditExerciseSheet(vm: vm, exercise: exercise)
+        }
+        .confirmationDialog(
+            "Delete \"\(deleteTarget?.exercise_name ?? "")\"?",
+            isPresented: Binding(
+                get: { deleteTarget != nil },
+                set: { if !$0 { deleteTarget = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let ex = deleteTarget {
+                Button("Delete Exercise", role: .destructive) {
+                    Task { await vm.delete(ex) }
+                    deleteTarget = nil
+                }
+                Button("Cancel", role: .cancel) { deleteTarget = nil }
+            }
+        } message: {
+            Text("Only possible if no workouts use this exercise.")
         }
         .colorScheme(.dark)
     }
 
     // MARK: - Row
 
+    @ViewBuilder
     private func exerciseRow(_ exercise: Exercise) -> some View {
-        GlassCard(padding: 14) {
+        let card = GlassCard(padding: 14) {
             HStack(spacing: 14) {
                 let group = muscleGroup(for: exercise)
                 Circle()
@@ -130,6 +203,22 @@ struct ExercisesView: View {
                     .foregroundStyle(.white)
                 Spacer()
             }
+        }
+        if exercise.isEditable {
+            card.contextMenu {
+                Button {
+                    editTarget = exercise
+                } label: {
+                    Label("Edit Exercise", systemImage: "pencil")
+                }
+                Button(role: .destructive) {
+                    deleteTarget = exercise
+                } label: {
+                    Label("Delete Exercise", systemImage: "trash")
+                }
+            }
+        } else {
+            card
         }
     }
 
@@ -160,17 +249,17 @@ struct ExercisesView: View {
         Button { showAdd = true } label: {
             Image(systemName: "plus")
                 .font(.system(size: 22, weight: .bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(.black)
                 .frame(width: 56, height: 56)
                 .background(
                     LinearGradient(
-                        colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                 Color(red: 0.45, green: 0.2, blue: 0.95)],
+                        colors: [Color.appAccent,
+                                 Color.appAccentDeep],
                         startPoint: .topLeading, endPoint: .bottomTrailing
                     )
                 )
                 .clipShape(Circle())
-                .shadow(color: Color(red: 0.3, green: 0.4, blue: 1.0).opacity(0.5), radius: 16, y: 6)
+                .shadow(color: Color.appAccent.opacity(0.5), radius: 16, y: 6)
         }
     }
 }
@@ -182,6 +271,8 @@ struct AddExerciseSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var selectedGroup: MuscleGroup? = nil
+    @State private var isLoading = false
+    @State private var errorMessage: String?
 
     var body: some View {
         VStack(spacing: 24) {
@@ -231,14 +322,125 @@ struct AddExerciseSheet: View {
             }
             .padding(.horizontal, 20)
 
-            GlassButton("Add Exercise", icon: "plus.circle.fill") {
+            if let err = errorMessage {
+                Text(err).font(.caption)
+                    .foregroundStyle(Color.appDanger)
+                    .padding(.horizontal, 20)
+            }
+
+            GlassButton(isLoading ? "Adding..." : "Add Exercise", icon: "plus.circle.fill") {
                 let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { return }
+                isLoading = true
+                errorMessage = nil
                 Task {
-                    await vm.create(name: trimmed, muscleGroup: selectedGroup?.rawValue)
-                    dismiss()
+                    let ok = await vm.create(name: trimmed, muscleGroup: selectedGroup?.rawValue)
+                    isLoading = false
+                    if ok {
+                        dismiss()
+                    } else {
+                        // Keep the sheet open so the entered name isn't lost
+                        errorMessage = vm.errorMessage ?? "Couldn't add the exercise."
+                    }
                 }
             }
+            .disabled(isLoading)
+            .opacity(isLoading ? 0.6 : 1)
+            .padding(.horizontal, 20)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background { AnimatedBackground() }
+        .colorScheme(.dark)
+    }
+}
+
+// MARK: - Edit Exercise Sheet
+
+struct EditExerciseSheet: View {
+    var vm: ExercisesViewModel
+    let exercise: Exercise
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var selectedGroup: MuscleGroup?
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    init(vm: ExercisesViewModel, exercise: Exercise) {
+        self.vm = vm
+        self.exercise = exercise
+        _name = State(initialValue: exercise.exercise_name)
+        _selectedGroup = State(initialValue: exercise.muscle_group.flatMap { MuscleGroup(rawValue: $0) })
+    }
+
+    var body: some View {
+        VStack(spacing: 24) {
+            RoundedRectangle(cornerRadius: 3).fill(.white.opacity(0.3))
+                .frame(width: 36, height: 4).padding(.top, 12)
+
+            Text("Edit Exercise").font(.title2.bold()).foregroundStyle(.white)
+
+            GlassCard {
+                VStack(spacing: 16) {
+                    GlassTextField(placeholder: "Exercise name", icon: "dumbbell", text: $name)
+
+                    Divider().background(.white.opacity(0.08))
+
+                    Menu {
+                        ForEach(MuscleGroup.allCases, id: \.self) { group in
+                            Button { selectedGroup = group } label: { Text(group.rawValue) }
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            if let group = selectedGroup {
+                                Circle().fill(group.color).frame(width: 10, height: 10)
+                                Text(group.rawValue).foregroundStyle(.white)
+                            } else {
+                                Image(systemName: "tag")
+                                    .foregroundStyle(.white.opacity(0.4))
+                                    .frame(width: 20)
+                                Text("Muscle Group (optional)")
+                                    .foregroundStyle(.white.opacity(0.4))
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.4))
+                        }
+                        .padding(.horizontal, 4)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+
+            if let err = errorMessage {
+                Text(err).font(.caption)
+                    .foregroundStyle(Color.appDanger)
+                    .padding(.horizontal, 20)
+            }
+
+            GlassButton(isLoading ? "Saving..." : "Save Changes", icon: "checkmark.circle.fill") {
+                let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                isLoading = true
+                errorMessage = nil
+                Task {
+                    let ok = await vm.update(
+                        id: exercise.exercise_id,
+                        name: trimmed,
+                        muscleGroup: selectedGroup?.rawValue
+                    )
+                    isLoading = false
+                    if ok {
+                        dismiss()
+                    } else {
+                        errorMessage = vm.errorMessage ?? "Couldn't save the exercise."
+                    }
+                }
+            }
+            .disabled(isLoading)
+            .opacity(isLoading ? 0.6 : 1)
             .padding(.horizontal, 20)
 
             Spacer()

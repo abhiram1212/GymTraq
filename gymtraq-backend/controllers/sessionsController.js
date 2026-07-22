@@ -32,7 +32,7 @@ const updateSession = async (req, res) => {
   const { date, notes, name } = req.body;
   try {
     const result = await db.query(
-      `UPDATE sessions SET date = COALESCE($1, date), notes = $2, name = COALESCE($3, name)
+      `UPDATE sessions SET date = COALESCE($1, date), notes = $2, name = $3
        WHERE session_id = $4 AND user_id = $5
        RETURNING *`,
       [date, notes, name, req.params.id, req.user_id]

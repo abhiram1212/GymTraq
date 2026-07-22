@@ -12,28 +12,23 @@ struct ChatView: View {
                     Circle()
                         .fill(
                             LinearGradient(
-                                colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                         Color(red: 0.45, green: 0.2, blue: 0.95)],
+                                colors: [Color.appAccent,
+                                         Color.appAccentDeep],
                                 startPoint: .topLeading, endPoint: .bottomTrailing
                             )
                         )
                         .frame(width: 40, height: 40)
                     Image(systemName: "sparkles")
                         .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.black)
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     Text("AI Coach")
                         .font(.system(size: 20, weight: .bold, design: .rounded))
                         .foregroundStyle(.white)
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(Color(red: 0.2, green: 0.9, blue: 0.5))
-                            .frame(width: 6, height: 6)
-                        Text("Online")
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.45))
-                    }
+                    Text("Your personal trainer")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.45))
                 }
                 Spacer()
             }
@@ -61,6 +56,10 @@ struct ChatView: View {
                     .padding(.bottom, 8)
                 }
                 .scrollIndicators(.hidden)
+                .refreshable { await vm.loadHistory() }
+                // Dragging the conversation or tapping it dismisses the keyboard
+                .scrollDismissesKeyboard(.interactively)
+                .onTapGesture { inputFocused = false }
                 .onChange(of: vm.messages.count) {
                     withAnimation {
                         if let lastId = vm.messages.last?.id {
@@ -75,12 +74,34 @@ struct ChatView: View {
                 }
             }
 
+            // Error banner — a failed send restores the text; tell the user why
+            if let err = vm.errorMessage {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.circle")
+                    Text(err).font(.caption)
+                    Spacer()
+                    Button { vm.errorMessage = nil } label: {
+                        Image(systemName: "xmark").font(.caption2.weight(.bold))
+                    }
+                }
+                .foregroundStyle(Color.appDanger)
+                .padding(10)
+                .background(Color.appDanger.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 16)
+                .task(id: err) {
+                    // Auto-dismiss after a few seconds; the input text is already restored
+                    try? await Task.sleep(for: .seconds(5))
+                    vm.errorMessage = nil
+                }
+            }
+
             // Input bar
             inputBar
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background { AnimatedBackground() }
-        .task { await vm.loadHistory() }
+        .task { await vm.loadHistoryIfNeeded() }
         .colorScheme(.dark)
     }
 
@@ -89,10 +110,16 @@ struct ChatView: View {
     private var inputBar: some View {
         @Bindable var bvm = vm
         return HStack(spacing: 12) {
-            TextField("Ask your coach...", text: $bvm.inputText, axis: .vertical)
-                .lineLimit(1...4)
+            TextField("Ask your coach...", text: $bvm.inputText)
                 .foregroundStyle(.white)
                 .focused($inputFocused)
+                // Return key reads "Send" and actually sends (multiline axis
+                // swallows the return key as a newline, so single-line it is)
+                .submitLabel(.send)
+                .onSubmit {
+                    inputFocused = false
+                    Task { await vm.send() }
+                }
 
             Button {
                 inputFocused = false
@@ -104,8 +131,8 @@ struct ChatView: View {
                         vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.isSending
                             ? AnyShapeStyle(.white.opacity(0.2))
                             : AnyShapeStyle(LinearGradient(
-                                colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                         Color(red: 0.45, green: 0.2, blue: 0.95)],
+                                colors: [Color.appAccent,
+                                         Color.appAccentDeep],
                                 startPoint: .topLeading, endPoint: .bottomTrailing
                             ))
                     )
@@ -113,11 +140,7 @@ struct ChatView: View {
             .disabled(vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.isSending)
         }
         .padding(14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
-        )
+        .background(Color.appCard, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .padding(.horizontal, 16)
         .padding(.bottom, 12)
         .padding(.top, 8)
@@ -131,8 +154,8 @@ struct ChatView: View {
                 .font(.system(size: 44))
                 .foregroundStyle(
                     LinearGradient(
-                        colors: [Color(red: 0.4, green: 0.7, blue: 1.0),
-                                 Color(red: 0.6, green: 0.3, blue: 1.0)],
+                        colors: [Color.appAccent,
+                                 Color.appAccentDeep],
                         startPoint: .topLeading, endPoint: .bottomTrailing
                     )
                 )
@@ -150,6 +173,7 @@ struct ChatView: View {
                 ForEach(suggestions, id: \.self) { suggestion in
                     Button {
                         vm.inputText = suggestion
+                        Task { await vm.send() }
                     } label: {
                         Text(suggestion)
                             .font(.subheadline)
@@ -186,6 +210,17 @@ struct MessageBubble: View {
     let message: ChatMessage
     var isUser: Bool { message.role == "user" }
 
+    // Claude replies in markdown (**bold**, `code`, lists) — render it instead
+    // of printing raw asterisks. Falls back to plain text if parsing fails.
+    private var renderedText: AttributedString {
+        (try? AttributedString(
+            markdown: message.message,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace
+            )
+        )) ?? AttributedString(message.message)
+    }
+
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
             if isUser { Spacer(minLength: 48) }
@@ -195,35 +230,28 @@ struct MessageBubble: View {
                     Circle()
                         .fill(
                             LinearGradient(
-                                colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                         Color(red: 0.45, green: 0.2, blue: 0.95)],
+                                colors: [Color.appAccent,
+                                         Color.appAccentDeep],
                                 startPoint: .topLeading, endPoint: .bottomTrailing
                             )
                         )
                         .frame(width: 28, height: 28)
                     Image(systemName: "sparkles")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.black)
                 }
             }
 
-            Text(message.message)
+            // User bubble: accent with black text (Fitness CTA pairing);
+            // AI bubble: flat card gray — iMessage-like hierarchy
+            Text(renderedText)
                 .font(.system(size: 15))
-                .foregroundStyle(.white)
+                .foregroundStyle(isUser ? Color.black : Color.white)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(
-                    isUser
-                        ? AnyShapeStyle(LinearGradient(
-                            colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                     Color(red: 0.45, green: 0.2, blue: 0.95)],
-                            startPoint: .topLeading, endPoint: .bottomTrailing))
-                        : AnyShapeStyle(.ultraThinMaterial),
+                    isUser ? Color.appAccent : Color.appCard,
                     in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(isUser ? .clear : .white.opacity(0.1), lineWidth: 1)
                 )
 
             if !isUser { Spacer(minLength: 48) }
@@ -234,7 +262,7 @@ struct MessageBubble: View {
 // MARK: - Typing Indicator
 
 struct TypingIndicator: View {
-    @State private var phase = 0
+    @State private var animating = false
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -242,34 +270,34 @@ struct TypingIndicator: View {
                 Circle()
                     .fill(
                         LinearGradient(
-                            colors: [Color(red: 0.2, green: 0.5, blue: 1.0),
-                                     Color(red: 0.45, green: 0.2, blue: 0.95)],
+                            colors: [Color.appAccent,
+                                     Color.appAccentDeep],
                             startPoint: .topLeading, endPoint: .bottomTrailing
                         )
                     )
                     .frame(width: 28, height: 28)
                 Image(systemName: "sparkles")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(.black)
             }
             HStack(spacing: 4) {
                 ForEach(0..<3, id: \.self) { i in
                     Circle()
                         .fill(.white.opacity(0.5))
                         .frame(width: 7, height: 7)
-                        .scaleEffect(phase == i ? 1.3 : 0.8)
+                        .scaleEffect(animating ? 1.3 : 0.8)
                         .animation(
-                            .easeInOut(duration: 0.4).repeatForever().delay(Double(i) * 0.15),
-                            value: phase
+                            .easeInOut(duration: 0.4).repeatForever(autoreverses: true).delay(Double(i) * 0.15),
+                            value: animating
                         )
                 }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 14)
-            .background(.ultraThinMaterial,
+            .background(Color.appCard,
                         in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             Spacer()
         }
-        .onAppear { phase = 1 }
+        .onAppear { animating = true }
     }
 }
