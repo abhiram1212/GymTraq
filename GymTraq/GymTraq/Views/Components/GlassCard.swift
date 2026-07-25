@@ -117,8 +117,10 @@ struct GlassTextField: View {
                 )
             } else {
                 TextField(placeholder, text: $text)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
+                    // Autocorrect off only for email; on elsewhere so iOS text
+                    // replacement (keyboard shortcuts) and suggestions work
+                    .textInputAutocapitalization(isEmail ? .never : .sentences)
+                    .autocorrectionDisabled(isEmail)
                     .keyboardType(isEmail ? .emailAddress : .default)
                     .textContentType(isEmail ? .emailAddress : nil)
             }

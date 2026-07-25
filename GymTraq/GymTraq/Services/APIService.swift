@@ -15,7 +15,7 @@ enum APIServiceError: LocalizedError {
 @Observable
 class APIService {
     static let shared = APIService()
-    private let baseURL = "http://192.168.0.206:3000"
+    private let baseURL = "http://3.21.66.17:3000" // AWS EC2 (Elastic IP)
 
     // URLSession.shared waits 60s per request — far too long for a snappy UI.
     // Fail fast so error states show within seconds when the server is unreachable.
@@ -154,6 +154,10 @@ class APIService {
         // Patch semantics server-side: only profile_pic changes
         let data = try await request("/users/\(id)", method: "PUT", body: ["profile_pic": base64])
         return try JSONDecoder().decode(User.self, from: data)
+    }
+
+    func deleteAccount(id: Int) async throws {
+        _ = try await request("/users/\(id)", method: "DELETE")
     }
 
     func changePassword(id: Int, currentPassword: String, newPassword: String) async throws {

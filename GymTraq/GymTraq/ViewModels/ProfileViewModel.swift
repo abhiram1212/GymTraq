@@ -28,9 +28,11 @@ class ProfileViewModel {
     // Profile lives in the shared store so the Home header stays in sync
     var user: User? { UserStore.shared.user }
 
-    // Edit fields
+    // Edit fields (weightText/heightText hold values in the user's chosen unit)
     var weightText = ""
-    var heightText = ""
+    var heightText = ""   // used when height unit is cm
+    var feetText = ""     // used when height unit is ft/in
+    var inchesText = ""
     var ageText = ""
     var sex = ""
 
@@ -39,6 +41,7 @@ class ProfileViewModel {
     var newPassword = ""
     var confirmPassword = ""
     var isChangingPassword = false
+    var isDeletingAccount = false
 
     func load() async {
         isLoading = user == nil
@@ -49,10 +52,19 @@ class ProfileViewModel {
     }
 
     private func populateFields() {
-        weightText = user?.weight.map { String($0) } ?? ""
-        heightText = user?.height.map { String($0) } ?? ""
-        ageText    = user?.age.map    { String($0) } ?? ""
-        sex        = user?.sex ?? ""
+        let units = UnitSettings.shared
+        // Weight: stored kg → display unit
+        weightText = user?.weight.map { units.trim(units.weight.fromKg($0)) } ?? ""
+        // Height: stored cm → cm field or ft+in fields
+        if let cm = user?.height {
+            heightText = units.trim(cm)
+            let (f, i) = HeightUnit.ftin.feetInches(fromCm: cm)
+            feetText = "\(f)"; inchesText = "\(i)"
+        } else {
+            heightText = ""; feetText = ""; inchesText = ""
+        }
+        ageText = user?.age.map { String($0) } ?? ""
+        sex     = user?.sex ?? ""
     }
 
     func beginEditing() {
@@ -70,18 +82,39 @@ class ProfileViewModel {
 
     func save() async {
         guard let id = APIService.shared.userId else { return }
+        let units = UnitSettings.shared
         errorMessage = nil
         successMessage = nil
 
-        // Parse loudly — silently dropping a bad field would wipe the stored value
-        let weight = parseDecimal(weightText)
-        if !weightText.isEmpty && weight == nil {
-            errorMessage = "Weight must be a number."; return
+        // Weight: entered in display unit → convert to kg for storage
+        var weightKg: Double?
+        if !weightText.isEmpty {
+            guard let entered = parseDecimal(weightText) else {
+                errorMessage = "Weight must be a number."; return
+            }
+            weightKg = units.weight.toKg(entered)
         }
-        let height = parseDecimal(heightText)
-        if !heightText.isEmpty && height == nil {
-            errorMessage = "Height must be a number."; return
+
+        // Height: cm field, or feet+inches → convert to cm for storage
+        var heightCm: Double?
+        switch units.height {
+        case .cm:
+            if !heightText.isEmpty {
+                guard let cm = parseDecimal(heightText) else {
+                    errorMessage = "Height must be a number."; return
+                }
+                heightCm = cm
+            }
+        case .ftin:
+            if !feetText.isEmpty || !inchesText.isEmpty {
+                guard let f = Int(feetText.isEmpty ? "0" : feetText),
+                      let i = Int(inchesText.isEmpty ? "0" : inchesText) else {
+                    errorMessage = "Height must be whole numbers."; return
+                }
+                heightCm = HeightUnit.ftin.cm(fromFeet: f, inches: i)
+            }
         }
+
         let age = Int(ageText)
         if !ageText.isEmpty && age == nil {
             errorMessage = "Age must be a whole number."; return
@@ -90,7 +123,7 @@ class ProfileViewModel {
         isSaving = true
         do {
             let updated = try await APIService.shared.updateUser(
-                id: id, weight: weight, height: height, age: age,
+                id: id, weight: weightKg, height: heightCm, age: age,
                 sex: sex.isEmpty ? nil : sex
             )
             UserStore.shared.user = updated
@@ -175,6 +208,24 @@ class ProfileViewModel {
         let v = w / ((h / 100) * (h / 100))
         let label = v < 18.5 ? "Underweight" : v < 25 ? "Healthy" : v < 30 ? "Overweight" : "Obese"
         return (v, label)
+    }
+
+    // MARK: - Delete account
+
+    @discardableResult
+    func deleteAccount() async -> Bool {
+        guard let id = APIService.shared.userId else { return false }
+        isDeletingAccount = true
+        errorMessage = nil
+        do {
+            try await APIService.shared.deleteAccount(id: id)
+            isDeletingAccount = false
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            isDeletingAccount = false
+            return false
+        }
     }
 
     // MARK: - Password

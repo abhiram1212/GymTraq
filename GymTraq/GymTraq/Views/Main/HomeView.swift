@@ -72,14 +72,17 @@ struct HomeView: View {
                     : AnyShapeStyle(.white.opacity(0.35))
             )
             .background {
-                // The selected button carries its own glass pill; matchedGeometryEffect
-                // slides it between tabs instead of leaving the glass static behind the bar
+                // Plain accent capsule slides between tabs via matchedGeometry.
+                // (An .interactive() glass pill here stole taps — its own gesture
+                // recognizer competed with the button, needing 2–3 taps.)
                 if selectedTab == tag {
-                    Color.clear
-                        .glassEffect(.regular.interactive(), in: .capsule)
+                    Capsule()
+                        .fill(Color.appAccent.opacity(0.16))
                         .matchedGeometryEffect(id: "selectedTab", in: tabHighlight)
                 }
             }
+            // Make the whole cell — including transparent padding — tappable
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }

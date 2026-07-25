@@ -5,8 +5,8 @@ struct ProfileView: View {
     @Environment(AuthViewModel.self) private var authVM
     @Environment(\.dismiss) private var dismiss
     @State private var vm = ProfileViewModel()
-    @State private var showPasswordSection = false
     @State private var showPhotoPicker = false
+    @State private var showSettings = false
     @State private var photoItem: PhotosPickerItem?
 
     var body: some View {
@@ -22,7 +22,6 @@ struct ProfileView: View {
                     } else {
                         trainingStatsSection
                         bodyStatsSection
-                        passwordSection
                         signOutSection
                     }
 
@@ -53,6 +52,9 @@ struct ProfileView: View {
         .task { await vm.load() }
         .keyboardDoneButton()
         .photosPicker(isPresented: $showPhotoPicker, selection: $photoItem, matching: .images)
+        .sheet(isPresented: $showSettings) {
+            SettingsView()
+        }
         .onChange(of: photoItem) { _, item in
             guard let item else { return }
             Task {
@@ -103,6 +105,12 @@ struct ProfileView: View {
                 } label: {
                     Label(vm.user?.profile_pic == nil ? "Add Photo" : "Change Photo",
                           systemImage: "photo")
+                }
+                Divider()
+                Button {
+                    showSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
                 }
             } label: {
                 Image(systemName: "ellipsis")
@@ -247,11 +255,12 @@ struct ProfileView: View {
     }
 
     private var displayRows: some View {
-        VStack(spacing: 14) {
+        let units = UnitSettings.shared
+        return VStack(spacing: 14) {
             displayRow(label: "Weight", icon: "scalemass",
-                       value: vm.user?.weight.map { "\(trimmed($0)) kg" })
+                       value: vm.user?.weight.map { units.weightLabel(fromKg: $0) })
             displayRow(label: "Height", icon: "ruler",
-                       value: vm.user?.height.map { "\(trimmed($0)) cm" })
+                       value: vm.user?.height.map { units.heightLabel(fromCm: $0) })
             displayRow(label: "Age", icon: "calendar.badge.clock",
                        value: vm.user?.age.map { "\($0)" })
             displayRow(label: "Sex", icon: "figure.stand",
@@ -299,13 +308,42 @@ struct ProfileView: View {
     }
 
     private var editFields: some View {
-        VStack(spacing: 14) {
+        let units = UnitSettings.shared
+        return VStack(spacing: 14) {
             @Bindable var bvm = vm
 
-            profileField(label: "Weight (kg)", icon: "scalemass",
-                         placeholder: "e.g. 80", text: $bvm.weightText)
-            profileField(label: "Height (cm)", icon: "ruler",
-                         placeholder: "e.g. 180", text: $bvm.heightText)
+            profileField(label: "Weight (\(units.weight.label))", icon: "scalemass",
+                         placeholder: units.weight == .kg ? "e.g. 80" : "e.g. 176",
+                         text: $bvm.weightText)
+
+            // Height entry adapts to the unit: single cm field, or feet + inches
+            if units.height == .cm {
+                profileField(label: "Height (cm)", icon: "ruler",
+                             placeholder: "e.g. 180", text: $bvm.heightText)
+            } else {
+                HStack(spacing: 12) {
+                    Image(systemName: "ruler")
+                        .foregroundStyle(.white.opacity(0.45))
+                        .frame(width: 20)
+                    Text("Height")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.6))
+                    Spacer()
+                    TextField("ft", text: $bvm.feetText)
+                        .keyboardType(.numberPad)
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 44)
+                    Text("ft").font(.caption).foregroundStyle(.white.opacity(0.4))
+                    TextField("in", text: $bvm.inchesText)
+                        .keyboardType(.numberPad)
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 44)
+                    Text("in").font(.caption).foregroundStyle(.white.opacity(0.4))
+                }
+            }
+
             profileField(label: "Age", icon: "calendar.badge.clock",
                          placeholder: "e.g. 25", text: $bvm.ageText)
 
@@ -346,62 +384,6 @@ struct ProfileView: View {
         value.truncatingRemainder(dividingBy: 1) == 0
             ? String(format: "%.0f", value)
             : String(format: "%.1f", value)
-    }
-
-    // MARK: - Password
-
-    private var passwordSection: some View {
-        GlassCard {
-            VStack(spacing: 0) {
-                Button {
-                    withAnimation(.spring(duration: 0.3)) {
-                        showPasswordSection.toggle()
-                        vm.errorMessage = nil
-                        vm.successMessage = nil
-                    }
-                } label: {
-                    HStack {
-                        sectionHeader("Change Password", icon: "lock.rotation")
-                        Spacer()
-                        Image(systemName: showPasswordSection ? "chevron.up" : "chevron.down")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white.opacity(0.4))
-                    }
-                }
-                .buttonStyle(.plain)
-
-                if showPasswordSection {
-                    @Bindable var bvm = vm
-
-                    VStack(spacing: 14) {
-                        Divider().background(.white.opacity(0.08)).padding(.vertical, 12)
-
-                        secureField(label: "Current Password", icon: "lock",
-                                    placeholder: "Enter current password", text: $bvm.currentPassword,
-                                    contentType: .password)
-                        secureField(label: "New Password", icon: "lock.open",
-                                    placeholder: "At least 8 characters", text: $bvm.newPassword,
-                                    contentType: .newPassword)
-                        secureField(label: "Confirm New", icon: "lock.open",
-                                    placeholder: "Repeat new password", text: $bvm.confirmPassword,
-                                    contentType: .newPassword)
-
-                        Divider().background(.white.opacity(0.08)).padding(.vertical, 4)
-
-                        GlassButton(
-                            vm.isChangingPassword ? "Updating..." : "Update Password",
-                            icon: "checkmark.shield.fill",
-                            isPrimary: false
-                        ) {
-                            Task { await vm.changePassword() }
-                        }
-                        .disabled(vm.isChangingPassword)
-                        .opacity(vm.isChangingPassword ? 0.6 : 1)
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-        }
     }
 
     // MARK: - Sign Out
@@ -456,21 +438,6 @@ struct ProfileView: View {
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.trailing)
         }
-    }
-
-    private func secureField(label: String, icon: String, placeholder: String,
-                              text: Binding<String>,
-                              contentType: UITextContentType = .password) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .foregroundStyle(.white.opacity(0.45))
-                .frame(width: 20)
-            RevealableSecureField(placeholder: placeholder, text: text, contentType: contentType)
-                .foregroundStyle(.white)
-        }
-        .padding(12)
-        .background(Color.appCardElevated,
-                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private func feedbackBanner(_ message: String, isError: Bool) -> some View {
