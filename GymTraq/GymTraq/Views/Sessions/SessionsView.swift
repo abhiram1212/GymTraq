@@ -9,6 +9,21 @@ struct SessionsView: View {
     @State private var showProfile = false
     @State private var selectedSession: WorkoutSession?
     @State private var sessionToDelete: WorkoutSession?
+    @State private var selectedDate = Date()
+    @State private var calendarMonth = Date()
+
+    private static let ymd: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.calendar = .current; return f
+    }()
+
+    // Days that have at least one workout — drives the calendar dots
+    private var workoutDates: Set<String> { Set(vm.sessions.map(\.date)) }
+
+    // Sessions on the selected calendar day
+    private var daySessions: [WorkoutSession] {
+        let key = Self.ymd.string(from: selectedDate)
+        return vm.sessions.filter { $0.date == key }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,10 +61,7 @@ struct SessionsView: View {
             } else if vm.sessions.isEmpty {
                 emptyState
             } else {
-                weeklyGoalCard
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 10)
-                sessionList
+                calendarScroll
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -82,7 +94,7 @@ struct SessionsView: View {
             Text("This will permanently delete the session and all its entries.")
         }
         .sheet(isPresented: $showAdd) {
-            AddSessionSheet(vm: vm)
+            AddSessionSheet(vm: vm, initialDate: selectedDate)
         }
         .sheet(item: $selectedSession, onDismiss: {
             // Sets added/removed in the detail view change the card summaries
@@ -123,35 +135,68 @@ struct SessionsView: View {
         }
     }
 
-    // MARK: - Session list
+    // MARK: - Calendar + selected-day list
 
-    // A plain, transparent List instead of ScrollView+LazyVStack — List is the
-    // only container where .swipeActions works, and swipe-to-delete is expected here
-    private var sessionList: some View {
-        List {
-            ForEach(vm.sessions) { session in
-                Button {
-                    selectedSession = session
-                } label: {
-                    SessionCard(session: session, summary: vm.exerciseSummary(for: session.session_id))
+    private var calendarScroll: some View {
+        ScrollView {
+            VStack(spacing: 14) {
+                weeklyGoalCard
+                WorkoutCalendarView(
+                    workoutDates: workoutDates,
+                    selectedDate: $selectedDate,
+                    month: $calendarMonth
+                )
+                selectedDaySection
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 16)
+        }
+        .scrollIndicators(.hidden)
+        .refreshable { await vm.load() }
+    }
+
+    private var selectedDaySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(selectedDayTitle)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .textCase(.uppercase)
+                    .tracking(0.5)
+                Spacer()
+                if !daySessions.isEmpty {
+                    Text("\(daySessions.count)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.35))
                 }
-                .buttonStyle(PressableCardStyle()) // Apple-style press-down feedback
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button(role: .destructive) {
-                            sessionToDelete = session
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
+            }
+            .padding(.top, 4)
+
+            if daySessions.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "moon.zzz")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.white.opacity(0.15))
+                    Text("No workout logged")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.35))
+                    Button { showAdd = true } label: {
+                        Text("Log one")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 18).padding(.vertical, 9)
+                            .background(Color.appAccent, in: Capsule())
                     }
-                    // Swipe right to clone this workout into today
-                    .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                        Button {
-                            Task { await vm.repeatSession(session) }
-                        } label: {
-                            Label("Repeat", systemImage: "arrow.clockwise")
-                        }
-                        .tint(Color.appAccentDeep)
+                    .buttonStyle(PressableCardStyle())
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
+            } else {
+                ForEach(daySessions) { session in
+                    Button { selectedSession = session } label: {
+                        SessionCard(session: session, summary: vm.exerciseSummary(for: session.session_id))
                     }
+                    .buttonStyle(PressableCardStyle())
                     .contextMenu {
                         Button {
                             Task { await vm.repeatSession(session) }
@@ -164,15 +209,15 @@ struct SessionsView: View {
                             Label("Delete Session", systemImage: "trash")
                         }
                     }
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
+                }
             }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .scrollIndicators(.hidden)
-        .refreshable { await vm.load() }
+    }
+
+    private var selectedDayTitle: String {
+        let f = DateFormatter()
+        f.dateFormat = "EEEE, MMM d"
+        return Calendar.current.isDateInToday(selectedDate) ? "Today" : f.string(from: selectedDate)
     }
 
     // MARK: - Weekly goal & streak
@@ -358,10 +403,16 @@ struct AddSessionSheet: View {
     var vm: SessionsViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var sessionName = ""
-    @State private var date = Date()
+    @State private var date: Date
     @State private var notes = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
+
+    init(vm: SessionsViewModel, initialDate: Date = Date()) {
+        self.vm = vm
+        // Default the picker to the day selected in the calendar (capped at today)
+        _date = State(initialValue: min(initialDate, Date()))
+    }
 
     var body: some View {
         VStack(spacing: 24) {

@@ -21,6 +21,8 @@ struct SessionDetailView: View {
     @State private var restTask: Task<Void, Never>?
     @State private var showEditSession = false
     @State private var showAddExercise = false
+    @State private var showPlan = false
+    @State private var planAutoShown = false
     @State private var addSetTarget: Exercise?
     @State private var replaceTarget: ReplaceTarget?
     @Environment(\.dismiss) private var dismiss
@@ -158,7 +160,35 @@ struct SessionDetailView: View {
                 Task { await loadData() }
             }
         }
+        .sheet(isPresented: $showPlan) {
+            SessionPlanSheet(
+                exercises: exercises,
+                historySessions: historySessions,
+                historyEntries: historyEntries,
+                currentSessionId: session.session_id,
+                log: logPlanned
+            )
+            .presentationDetents([.large, .medium])  // drag down to minimize/dismiss
+            .presentationDragIndicator(.visible)
+        }
         .colorScheme(.dark)
+    }
+
+    // Log a planned set: parent owns set numbering + PR/rest-timer side effects
+    private func logPlanned(exercise: Exercise, reps: Int, weight: Double) async -> Bool {
+        let setN = nextSetNumber(for: exercise.exercise_id)
+        do {
+            let entry = try await APIService.shared.createEntry(
+                setNumber: setN, reps: reps, weight: weight,
+                sessionId: session.session_id, exerciseId: exercise.exercise_id
+            )
+            if !exerciseOrder.contains(entry.exercise_id) { exerciseOrder.append(entry.exercise_id) }
+            registerNewEntry(entry)
+            return true
+        } catch {
+            actionError = error.localizedDescription
+            return false
+        }
     }
 
     // MARK: - Header
@@ -182,19 +212,29 @@ struct SessionDetailView: View {
                     .foregroundStyle(.white.opacity(0.45))
             }
             Spacer()
-            Button { showEditSession = true } label: {
-                Image(systemName: "pencil")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.black)
-                    .padding(10)
-                    .background(
-                        LinearGradient(
-                            colors: [Color.appAccent,
-                                     Color.appAccentDeep],
-                            startPoint: .topLeading, endPoint: .bottomTrailing
-                        ),
-                        in: Circle()
-                    )
+            HStack(spacing: 8) {
+                // Reopen the target/plan sheet anytime (history + progressive targets)
+                Button { showPlan = true } label: {
+                    Image(systemName: "target")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(10)
+                        .background(Color.appCardElevated, in: Circle())
+                }
+                Button { showEditSession = true } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .padding(10)
+                        .background(
+                            LinearGradient(
+                                colors: [Color.appAccent,
+                                         Color.appAccentDeep],
+                                startPoint: .topLeading, endPoint: .bottomTrailing
+                            ),
+                            in: Circle()
+                        )
+                }
             }
         }
         .padding(.horizontal, 20)
@@ -578,6 +618,14 @@ struct SessionDetailView: View {
                 seen.insert(entry.exercise_id); order.append(entry.exercise_id)
             }
             exerciseOrder = order
+
+            // New/empty session → offer the plan once (progressive-overload targets).
+            // Only if there's history to suggest from; otherwise it'd be an empty prompt.
+            if entries.isEmpty && !planAutoShown {
+                planAutoShown = true
+                let hasHistory = historyEntries.contains { $0.session_id != session.session_id }
+                if hasHistory { showPlan = true }
+            }
         } catch {
             // Don't render a fake "No exercises yet" over a network failure
             loadError = error.localizedDescription
